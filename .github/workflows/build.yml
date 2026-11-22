@@ -27,6 +27,13 @@ jobs:
           powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File .\PCTuneUp.ps1 -SelfTest -Limited
           if ($LASTEXITCODE -ne 0) { throw "Self-test failed (exit code $LASTEXITCODE)" }
 
+      - name: Self-test - scan when WMI is not answering (simulated)
+        shell: powershell
+        timeout-minutes: 10
+        run: |
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File .\PCTuneUp.ps1 -SelfTest -Limited -SimulateNoWmi
+          if ($LASTEXITCODE -ne 0) { throw "Self-test (no WMI) failed (exit code $LASTEXITCODE)" }
+
       - name: Upload exe
         uses: actions/upload-artifact@v4
         with:

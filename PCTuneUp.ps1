@@ -12,6 +12,7 @@
 param(
     [switch]$Limited,    # do not ask for administrator rights
     [switch]$SelfTest,   # run a full scan without showing the window, print the results, exit (used by the build)
+    [switch]$SimulateNoWmi  # testing only: pretend Windows Management Instrumentation (WMI) is not answering
     [string]$DataRoot    # folder to keep reports/undo data in (the .exe passes its own folder)
 )
 
@@ -187,6 +188,44 @@ $script:ProtectedProcesses = @('system','idle','registry','smss','csrss','winini
     'spoolsv','audiodg','wudfhost','conhost','dllhost','taskhostw','runtimebroker','startmenuexperiencehost','searchhost','textinputhost')
 
 # ---------------------------------------------------------------------------
+#  WMI access with fallback, timeout and error recording.
+#  Tries Get-CimInstance, then the older Get-WmiObject. Never throws: returns
+#  nothing if both fail, and records why (shown as a finding after the scan).
+# ---------------------------------------------------------------------------
+$script:WmiProblems = New-Object System.Collections.ArrayList
+function Get-Cim {
+    param([Parameter(Position = 0)][string]$ClassName, [string]$Namespace = 'root/cimv2', [string]$Filter, [string[]]$Property, [switch]$Quiet)
+    $why = ''
+    if ($SimulateNoWmi) { $why = 'simulated failure (test mode)' }
+    else {
+        try {
+            $p = @{ ClassName = $ClassName; Namespace = $Namespace; ErrorAction = 'Stop'; OperationTimeoutSec = 20 }
+            if ($Filter) { $p.Filter = $Filter }
+            if ($Property) { $p.Property = $Property }
+            return (Get-CimInstance @p)
+        } catch { $why = $_.Exception.Message }
+        try {
+            $p = @{ Class = $ClassName; Namespace = $Namespace; ErrorAction = 'Stop' }
+            if ($Filter) { $p.Filter = $Filter }
+            if ($Property) { $p.Property = $Property }
+            return (Get-WmiObject @p)
+        } catch { }
+    }
+    if (-not $Quiet) { [void]$script:WmiProblems.Add(('{0}: {1}' -f $ClassName, $why.Trim())) }
+}
+
+function ConvertTo-DateTimeSafe($Value) {
+    # Get-CimInstance gives DateTime; Get-WmiObject gives a DMTF string like 20261122081500.500000+000
+    if ($Value -is [datetime]) { return $Value }
+    if ($Value -is [string] -and $Value) { try { return [Management.ManagementDateTimeConverter]::ToDateTime($Value) } catch { } }
+    return $null
+}
+
+function Get-RegValue([string]$Path, [string]$Name) {
+    try { return (Get-ItemProperty -LiteralPath $Path -Name $Name -ErrorAction Stop).$Name } catch { return $null }
+}
+
+# ---------------------------------------------------------------------------
 #  Measurement functions (all read-only)
 # ---------------------------------------------------------------------------
 function Get-ProcSnapshot {
@@ -201,7 +240,8 @@ function Get-ProcSnapshot {
 
 function Get-GpuUsage {
     # Per-process GPU use (Windows 10 1709+). Returns $null if not available.
-    try { $engines = Get-CimInstance -ClassName Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine -ErrorAction Stop } catch { return $null }
+    $engines = @(Get-Cim Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine -Quiet)
+    if ($engines.Count -eq 0) { return $null }
     $perPidType = @{}
     $perType = @{}
     foreach ($e in $engines) {
@@ -226,7 +266,7 @@ function Get-GpuUsage {
 function Get-Temperatures {
     $list = New-Object System.Collections.ArrayList
     try {
-        $tz = Get-CimInstance -Namespace 'root/wmi' -ClassName MSAcpi_ThermalZoneTemperature -ErrorAction Stop
+        $tz = @(Get-Cim MSAcpi_ThermalZoneTemperature -Namespace 'root/wmi' -Quiet)
         foreach ($t in $tz) {
             $c = [math]::Round(($t.CurrentTemperature / 10) - 273.15, 1)
             if ($c -gt 5 -and $c -lt 125) { [void]$list.Add([pscustomobject]@{ Source = [string]$t.InstanceName; Celsius = $c }) }
@@ -234,7 +274,7 @@ function Get-Temperatures {
     } catch { }
     if ($list.Count -eq 0) {
         try {
-            $tz = Get-CimInstance -ClassName Win32_PerfFormattedData_Counters_ThermalZoneInformation -ErrorAction Stop
+            $tz = @(Get-Cim Win32_PerfFormattedData_Counters_ThermalZoneInformation -Quiet)
             foreach ($t in $tz) {
                 $k = if ($t.HighPrecisionTemperature) { $t.HighPrecisionTemperature / 10 } else { [double]$t.Temperature }
                 $c = [math]::Round($k - 273.15, 1)
@@ -363,7 +403,7 @@ function Get-StartupItems {
 function Measure-Processes([int]$Seconds = 5, [scriptblock]$OnTick) {
     $cores = [Environment]::ProcessorCount
     $null = Get-GpuUsage   # prime the formatted counters
-    try { $null = Get-CimInstance Win32_PerfFormattedData_PerfDisk_PhysicalDisk -Filter "Name='_Total'" -ErrorAction Stop } catch { }
+    $null = Get-Cim Win32_PerfFormattedData_PerfDisk_PhysicalDisk -Filter "Name='_Total'" -Quiet
     $before = Get-ProcSnapshot
     $sw = [Diagnostics.Stopwatch]::StartNew()
     $loads = New-Object System.Collections.Generic.List[double]
@@ -371,11 +411,12 @@ function Measure-Processes([int]$Seconds = 5, [scriptblock]$OnTick) {
     $freqMHz = $null
     for ($i = 0; $i -lt $Seconds; $i++) {
         try {
-            $l = (Get-CimInstance Win32_Processor -ErrorAction Stop | Measure-Object -Property LoadPercentage -Average).Average
+            $procs = @(Get-Cim Win32_Processor -Property LoadPercentage -Quiet | Where-Object { $null -ne $_.LoadPercentage })
+            $l = if ($procs.Count -gt 0) { ($procs | Measure-Object -Property LoadPercentage -Average).Average } else { $null }
             if ($null -ne $l) { $loads.Add([double]$l) }
         } catch { }
         try {
-            $pi = Get-CimInstance Win32_PerfFormattedData_Counters_ProcessorInformation -Filter "Name='_Total'" -ErrorAction Stop
+            $pi = Get-Cim Win32_PerfFormattedData_Counters_ProcessorInformation -Filter "Name='_Total'" -Quiet | Select-Object -First 1
             if ($pi) { $perfs.Add([double]$pi.PercentProcessorPerformance); if ($pi.ProcessorFrequency) { $freqMHz = [int]$pi.ProcessorFrequency } }
         } catch { }
         if ($OnTick) { & $OnTick $i $Seconds }
@@ -387,10 +428,14 @@ function Measure-Processes([int]$Seconds = 5, [scriptblock]$OnTick) {
     $after = Get-ProcSnapshot
     $gpu = Get-GpuUsage
     $diskIdle = $null
-    try { $diskIdle = [double](Get-CimInstance Win32_PerfFormattedData_PerfDisk_PhysicalDisk -Filter "Name='_Total'" -ErrorAction Stop).PercentIdleTime } catch { }
+    $dd = Get-Cim Win32_PerfFormattedData_PerfDisk_PhysicalDisk -Filter "Name='_Total'" -Quiet | Select-Object -First 1
+    if ($dd -and $null -ne $dd.PercentIdleTime) { $diskIdle = [double]$dd.PercentIdleTime }
 
     $paths = @{}
-    try { foreach ($w in (Get-CimInstance Win32_Process -Property ProcessId, ExecutablePath -ErrorAction Stop)) { $paths[[int]$w.ProcessId] = [string]$w.ExecutablePath } } catch { }
+    foreach ($w in @(Get-Cim Win32_Process -Property ProcessId, ExecutablePath -Quiet)) { if ($w) { $paths[[int]$w.ProcessId] = [string]$w.ExecutablePath } }
+    if ($paths.Count -eq 0) {   # fallback without WMI (may miss protected processes)
+        foreach ($p in [Diagnostics.Process]::GetProcesses()) { try { $paths[$p.Id] = $p.MainModule.FileName } catch { } }
+    }
 
     $rows = New-Object System.Collections.ArrayList
     $sumCpu = 0.0
@@ -453,25 +498,61 @@ function Invoke-SystemScan([scriptblock]$ReportProgress) {
     $s = @{}
 
     & $ReportProgress 2 'Reading system information...'
-    $cs   = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
-    $os   = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
-    $cpus = @(Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue)
-    $encl = Get-CimInstance Win32_SystemEnclosure -ErrorAction SilentlyContinue
-    $bats = @(Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue)
-    $gpus = @(Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue)
+    $script:WmiProblems.Clear()
+    $cs   = Get-Cim Win32_ComputerSystem | Select-Object -First 1
+    $os   = Get-Cim Win32_OperatingSystem | Select-Object -First 1
+    $cpus = @(Get-Cim Win32_Processor | Where-Object { $_ })
+    $encl = Get-Cim Win32_SystemEnclosure -Quiet | Select-Object -First 1
+    $bats = @(Get-Cim Win32_Battery -Quiet | Where-Object { $_ })
+    $gpus = @(Get-Cim Win32_VideoController -Quiet | Where-Object { $_ })
+    $power = [System.Windows.Forms.SystemInformation]::PowerStatus   # works without WMI
+    $hasBattery = ($bats.Count -gt 0) -or ($power.BatteryChargeStatus -ne [System.Windows.Forms.BatteryChargeStatus]::NoSystemBattery -and $power.BatteryChargeStatus -ne [System.Windows.Forms.BatteryChargeStatus]::Unknown)
     $chassisLaptop = @($encl.ChassisTypes | Where-Object { $_ -in 8, 9, 10, 11, 12, 14, 18, 21, 30, 31, 32 }).Count -gt 0
-    $s.IsLaptop     = ($bats.Count -gt 0) -or $chassisLaptop
-    $s.Manufacturer = [string]$cs.Manufacturer
-    $s.Model        = [string]$cs.Model
-    $s.OS           = '{0} (build {1})' -f $os.Caption, $os.BuildNumber
-    $s.CpuName      = ($cpus | Select-Object -First 1).Name -replace '\s+', ' '
+    $s.IsLaptop     = $hasBattery -or $chassisLaptop
+
+    $biosKey = 'HKLM:\HARDWARE\DESCRIPTION\System\BIOS'
+    $s.Manufacturer = if ($cs.Manufacturer) { [string]$cs.Manufacturer } else { [string](Get-RegValue $biosKey 'SystemManufacturer') }
+    $s.Model        = if ($cs.Model) { [string]$cs.Model } else { [string](Get-RegValue $biosKey 'SystemProductName') }
+    if ($os.Caption) { $s.OS = '{0} (build {1})' -f $os.Caption, $os.BuildNumber }
+    else {
+        $nt = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+        $build = [string](Get-RegValue $nt 'CurrentBuild'); $prod = [string](Get-RegValue $nt 'ProductName')
+        if ([int]('0' + $build) -ge 22000) { $prod = $prod -replace 'Windows 10', 'Windows 11' }
+        $s.OS = '{0} (build {1})' -f $prod, $build
+    }
+    $cpuKey = 'HKLM:\HARDWARE\DESCRIPTION\System\CentralProcessor\0'
+    $cpuName = ($cpus | Select-Object -First 1).Name
+    if (-not $cpuName) { $cpuName = Get-RegValue $cpuKey 'ProcessorNameString' }
+    $s.CpuName      = ([string]$cpuName).Trim() -replace '\s+', ' '
     $s.Cores        = ($cpus | Measure-Object -Property NumberOfCores -Sum).Sum
+    if (-not $s.Cores) { $s.Cores = [Environment]::ProcessorCount }
     $s.Threads      = [Environment]::ProcessorCount
     $s.MaxClock     = ($cpus | Select-Object -First 1).MaxClockSpeed
+    if (-not $s.MaxClock) { $s.MaxClock = Get-RegValue $cpuKey '~MHz' }
     $s.GpuNames     = ($gpus | ForEach-Object { $_.Name }) -join '; '
-    $s.RamBytes     = [double]$cs.TotalPhysicalMemory
-    $s.LastBoot     = $os.LastBootUpTime
-    $s.Uptime       = (Get-Date) - $os.LastBootUpTime
+
+    # Memory: WMI first, then .NET (no WMI needed)
+    $s.RamBytes = [double]$cs.TotalPhysicalMemory
+    $s.RamTotalKB = [double]$os.TotalVisibleMemorySize
+    $s.RamFreeKB  = [double]$os.FreePhysicalMemory
+    if ($s.RamTotalKB -le 0) {
+        try {
+            Add-Type -AssemblyName Microsoft.VisualBasic
+            $ci = New-Object Microsoft.VisualBasic.Devices.ComputerInfo
+            $s.RamTotalKB = [double]$ci.TotalPhysicalMemory / 1KB
+            $s.RamFreeKB  = [double]$ci.AvailablePhysicalMemory / 1KB
+        } catch { }
+    }
+    if ($s.RamBytes -le 0) { $s.RamBytes = $s.RamTotalKB * 1KB }
+
+    # Last start-up: WMI first, then the Windows event log (Kernel-General event 12 = system start)
+    $boot = ConvertTo-DateTimeSafe $os.LastBootUpTime
+    if (-not $boot) {
+        $ev = Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-Kernel-General'; Id = 12 } -MaxEvents 1 -ErrorAction SilentlyContinue
+        if ($ev) { $boot = $ev.TimeCreated }
+    }
+    $s.LastBoot = $boot
+    $s.Uptime   = if ($boot) { (Get-Date) - $boot } else { $null }
     $s.Computer     = $env:COMPUTERNAME
 
     & $ReportProgress 8 'Measuring what is using the processor and graphics (5 seconds)...'
@@ -481,19 +562,21 @@ function Invoke-SystemScan([scriptblock]$ReportProgress) {
     & $ReportProgress 50 'Checking temperatures and fans...'
     $s.Temps = @(Get-Temperatures)
     $s.Fans  = @()
-    try { $s.Fans = @(Get-CimInstance Win32_Fan -ErrorAction Stop | Where-Object { $_.DesiredSpeed -or $_.ActiveCooling }) } catch { }
+    $s.Fans = @(Get-Cim Win32_Fan -Quiet | Where-Object { $_ -and ($_.DesiredSpeed -or $_.ActiveCooling) })
 
     & $ReportProgress 55 'Checking power settings...'
     $s.Power = Get-PowerInfo
 
     & $ReportProgress 60 'Checking memory...'
-    $s.RamTotalKB = [double]$os.TotalVisibleMemorySize
-    $s.RamFreeKB  = [double]$os.FreePhysicalMemory
     $s.RamUsedPct = if ($s.RamTotalKB -gt 0) { [math]::Round(100 * (1 - $s.RamFreeKB / $s.RamTotalKB), 0) } else { 0 }
-    $s.CommitPct  = if ($os.TotalVirtualMemorySize -gt 0) { [math]::Round(100 * (1 - $os.FreeVirtualMemory / $os.TotalVirtualMemorySize), 0) } else { 0 }
+    $s.CommitPct  = if ($os -and $os.TotalVirtualMemorySize -gt 0) { [math]::Round(100 * (1 - $os.FreeVirtualMemory / $os.TotalVirtualMemorySize), 0) } else { 0 }
 
     & $ReportProgress 64 'Checking drives...'
-    $s.Volumes = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction SilentlyContinue)
+    $s.Volumes = @(Get-Cim Win32_LogicalDisk -Filter 'DriveType=3' | Where-Object { $_ })
+    if ($s.Volumes.Count -eq 0) {   # fallback without WMI
+        $s.Volumes = @([IO.DriveInfo]::GetDrives() | Where-Object { $_.DriveType -eq 'Fixed' -and $_.IsReady } | ForEach-Object {
+            [pscustomobject]@{ DeviceID = $_.Name.TrimEnd('\'); Size = [double]$_.TotalSize; FreeSpace = [double]$_.AvailableFreeSpace } })
+    }
     $s.SystemDisk = $null
     $s.PhysicalDisks = @()
     try {
@@ -522,12 +605,16 @@ function Invoke-SystemScan([scriptblock]$ReportProgress) {
 
     & $ReportProgress 88 'Checking battery, security and pending restarts...'
     $s.OnBattery = $false; $s.BatteryWear = $null; $s.BatteryCharge = $null
+    if ($bats.Count -eq 0 -and $hasBattery) {
+        $s.OnBattery = ($power.PowerLineStatus -eq [System.Windows.Forms.PowerLineStatus]::Offline)
+        $s.BatteryCharge = [int]($power.BatteryLifePercent * 100)
+    }
     if ($bats.Count -gt 0) {
         $s.OnBattery = ($bats[0].BatteryStatus -eq 1)
         $s.BatteryCharge = $bats[0].EstimatedChargeRemaining
         try {
-            $design = (Get-CimInstance -Namespace 'root/wmi' -ClassName BatteryStaticData -ErrorAction Stop | Select-Object -First 1).DesignedCapacity
-            $full   = (Get-CimInstance -Namespace 'root/wmi' -ClassName BatteryFullChargedCapacity -ErrorAction Stop | Select-Object -First 1).FullChargedCapacity
+            $design = (Get-Cim BatteryStaticData -Namespace 'root/wmi' -Quiet | Select-Object -First 1).DesignedCapacity
+            $full   = (Get-Cim BatteryFullChargedCapacity -Namespace 'root/wmi' -Quiet | Select-Object -First 1).FullChargedCapacity
             if ($design -gt 0 -and $full -gt 0) { $s.BatteryWear = [math]::Round(100 * (1 - $full / $design), 0) }
         } catch { }
     }
@@ -637,7 +724,9 @@ function Invoke-Analysis($s) {
 
     # ---- Memory ----
     $ramGB = $s.RamBytes / 1GB
-    if ($s.RamUsedPct -ge 90) {
+    if ($s.RamTotalKB -le 0) {
+        Add-Finding 'Info' 'Memory' 'Could not read memory usage' 'Windows did not report memory figures to this tool.' 'Check memory use in Task Manager > Performance > Memory.'
+    } elseif ($s.RamUsedPct -ge 90) {
         Add-Finding 'Critical' 'Memory' ("Memory is almost full: {0}% used" -f $s.RamUsedPct) ("Total RAM {0:N1} GB. When RAM is full Windows constantly swaps to disk, which slows everything and adds CPU/disk load." -f $ramGB) 'Close programs and browser tabs, disable unneeded startup programs. If this is normal for you, adding RAM is the best upgrade.' @('startup')
         [void]$reasons.Add(("MEMORY FULL: {0}% of RAM is in use, so Windows is swapping to disk." -f $s.RamUsedPct))
     } elseif ($s.RamUsedPct -ge 80) {
@@ -645,7 +734,7 @@ function Invoke-Analysis($s) {
     } else {
         Add-Finding 'Good' 'Memory' ("Memory use is fine: {0}% of {1:N1} GB" -f $s.RamUsedPct, $ramGB) '' ''
     }
-    if ($ramGB -lt 7.5) {
+    if ($ramGB -gt 0 -and $ramGB -lt 7.5) {
         Add-Finding 'Info' 'Memory' ("Only {0:N1} GB of RAM installed" -f $ramGB) 'Windows 10/11 with a modern browser is comfortable with 8 GB and ideal with 16 GB.' 'If your PC allows it, upgrading to 8-16 GB is one of the most effective improvements.'
     }
 
@@ -697,7 +786,7 @@ function Invoke-Analysis($s) {
     }
 
     # ---- Uptime / restart ----
-    if ($s.Uptime.TotalDays -ge 7) {
+    if ($s.Uptime -and $s.Uptime.TotalDays -ge 7) {
         Add-Finding 'Warning' 'Windows' ("PC has not been restarted for {0:N0} days" -f $s.Uptime.TotalDays) 'Note: with Fast Startup, "Shut down" does not fully reset Windows - only "Restart" does. Long uptimes let memory leaks and stuck background tasks build up.' 'Use Start > Power > Restart (not Shut down) at least once a week.'
         [void]$reasons.Add(("NO RECENT RESTART: Windows has been running for {0:N0} days - stuck background tasks may be keeping the CPU busy. A Restart often calms the fan." -f $s.Uptime.TotalDays))
     }
@@ -727,6 +816,15 @@ function Invoke-Analysis($s) {
         if ($d.AntivirusSignatureLastUpdated -and ((Get-Date) - $d.AntivirusSignatureLastUpdated).TotalDays -gt 14) {
             Add-Finding 'Info' 'Security' ("Antivirus definitions are {0:N0} days old" -f ((Get-Date) - $d.AntivirusSignatureLastUpdated).TotalDays) 'This tool works offline and cannot update them.' 'Let Windows Update run next time the PC is online.'
         }
+    }
+
+    # ---- WMI health ----
+    if ($script:WmiProblems.Count -gt 0) {
+        $list = ($script:WmiProblems | Select-Object -Unique | Select-Object -First 6) -join ' | '
+        Add-Finding 'Warning' 'Windows' 'Windows Management Instrumentation (WMI) is not answering properly' `
+            ("Some system information could not be read, so the tool used other sources where it could. Errors: $list") `
+            'A faulty WMI can itself keep the processor busy (look for WmiPrvSE in the Processes tab). Restart the PC first. If this keeps appearing, open Command Prompt as administrator and run:  winmgmt /verifyrepository  - and if it reports a problem:  winmgmt /salvagerepository'
+        [void]$reasons.Add('WMI PROBLEM: the Windows system-information service (WMI) is not answering properly. A faulty WMI can itself cause constant CPU use - see the WMI finding below.')
     }
 
     # ---- Fan verdict ----
@@ -941,7 +1039,7 @@ function Export-Report([switch]$NoOpen) {
         'Graphics' = $s.GpuNames; 'Memory' = ('{0:N1} GB ({1}% in use)' -f ($s.RamBytes / 1GB), $s.RamUsedPct); 'Power plan' = $s.Power.Name
         'Average CPU load' = ('{0:N0}%' -f $s.Measure.TotalCpu); 'GPU load' = $(if ($null -ne $s.Measure.GpuOverall) { '{0:N0}%' -f $s.Measure.GpuOverall } else { 'n/a' })
         'Temperature' = $(if ($null -ne $s.MaxTemp) { '{0:N0} °C (highest sensor)' -f $s.MaxTemp } else { 'not exposed by this PC' })
-        'Uptime' = ('{0:N1} days' -f $s.Uptime.TotalDays); 'Type' = $(if ($s.IsLaptop) { 'Laptop' } else { 'Desktop' })
+        'Uptime' = $(if ($s.Uptime) { '{0:N1} days' -f $s.Uptime.TotalDays } else { 'unknown' }); 'Type' = $(if ($s.IsLaptop) { 'Laptop' } else { 'Desktop' })
     }
     foreach ($k in $sys.Keys) { [void]$sb.Append("<tr><th style='width:200px'>$(HtmlEnc $k)</th><td>$(HtmlEnc ([string]$sys[$k]))</td></tr>") }
     [void]$sb.Append('</table><h2>Findings &amp; recommendations</h2><table><tr><th>Severity</th><th>Area</th><th>Finding</th><th>Details</th><th>Recommendation</th></tr>')
@@ -1344,6 +1442,7 @@ if ($SelfTest) {
     $bugs = @($Error | Where-Object { $_.FullyQualifiedErrorId -match 'PropertyNotFound|PropertyAssignment|InvokeMethodOnNull|MethodNotFound|MethodCountCouldNotFindBest|ParameterArgument|ParameterBinding|CommandNotFound|NullArray|InvalidCast|ConvertToFinalInvalidCastException|RuntimeException' })
     Write-Host "PowerShell errors recorded: $($Error.Count) (script bugs: $($bugs.Count))"
     foreach ($e in $Error) { Write-Host ("  - {0}: {1}  {2}" -f $e.FullyQualifiedErrorId, $e.Exception.Message, ($e.InvocationInfo.PositionMessage -split "`n")[0]) }
+    if ($SimulateNoWmi -and -not ($script:Findings | Where-Object { $_.Title -like '*WMI*' })) { Write-Host 'Expected a WMI finding in simulated-failure mode.'; $failed = $true }
     if ($failed -or $bugs.Count -gt 0) { Write-Host 'SELF-TEST FAILED'; exit 1 }
     Write-Host 'SELF-TEST PASSED'
     exit 0

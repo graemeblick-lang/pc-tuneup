@@ -654,7 +654,7 @@ function Invoke-Analysis($s) {
         if (-not $v.Size) { continue }
         $freePct = [math]::Round(100 * $v.FreeSpace / $v.Size, 0)
         $isSys = ($v.DeviceID -eq $env:SystemDrive)
-        $label = '{0} {1}' -f $v.DeviceID, $(if ($isSys) { '(Windows drive)' } else { '' })
+        $label = if ($isSys) { '{0} (Windows drive)' -f $v.DeviceID } else { [string]$v.DeviceID }
         if ($freePct -lt 10) {
             Add-Finding 'Critical' 'Storage' ("Drive {0} is almost full: {1}% free ({2})" -f $label, $freePct, (Format-Bytes $v.FreeSpace)) 'Below 10% free space Windows slows down, updates fail and the page file cannot grow.' 'Clean temporary files and the Recycle Bin (Tune-Up tab), uninstall programs you do not use, move photos/videos to an external drive.' @('temp', 'recycle', 'dism')
         } elseif ($freePct -lt 20) {
@@ -1178,7 +1178,7 @@ function Start-Scan {
     $lblScore.Text = ''
     $txtFan.Text = 'Scanning... please keep using the PC as normal (or leave it idle) while the measurements are taken.'
     try {
-        Invoke-SystemScan -ReportProgress { param($pct, $msg) $script:pbScan.Value = [math]::Min(100, [math]::Max(0, [int]$pct)); $script:lblProgress.Text = $msg; [System.Windows.Forms.Application]::DoEvents() }
+        Invoke-SystemScan -ReportProgress { param($pct, $msg) $script:pbScan.Value = [math]::Min(100, [math]::Max(0, [int]$pct)); $script:lblProgress.Text = $msg; if ($SelfTest) { Write-Host ('{0:HH:mm:ss} [{1,3}%] {2}' -f (Get-Date), $pct, $msg) }; [System.Windows.Forms.Application]::DoEvents() }
         $s = $script:Scan
         Show-Findings
         Show-Processes $s.Measure

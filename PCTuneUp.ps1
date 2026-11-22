@@ -11,6 +11,7 @@
 #>
 param(
     [switch]$Limited,    # do not ask for administrator rights
+    [switch]$SelfTest,   # run a full scan without showing the window, print the results, exit (used by the build)
     [string]$DataRoot    # folder to keep reports/undo data in (the .exe passes its own folder)
 )
 
@@ -22,7 +23,7 @@ $script:SelfPath = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.M
 
 # Ask Windows for administrator rights (needed for tune-ups and some checks).
 # If the user clicks "No", carry on in limited (scan-only) mode.
-if (-not $script:IsAdmin -and -not $Limited -and $script:SelfPath) {
+if (-not $script:IsAdmin -and -not $Limited -and -not $SelfTest -and $script:SelfPath) {
     $elevArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File', "`"$script:SelfPath`"")
     if ($DataRoot) { $elevArgs += @('-DataRoot', "`"$DataRoot`"") }
     try {
@@ -38,6 +39,7 @@ Add-Type -AssemblyName System.Drawing
 
 # Show any unexpected start-up error in a message box (the console window is hidden)
 trap {
+    if ($SelfTest) { Write-Host "SELF-TEST FAILED: $($_.Exception.Message)`n$($_.InvocationInfo.PositionMessage)"; exit 1 }
     [System.Windows.Forms.MessageBox]::Show("PC TuneUp hit an unexpected error:`n`n$($_.Exception.Message)`n`n$($_.InvocationInfo.PositionMessage)", 'PC TuneUp', 'OK', 'Error') | Out-Null
     exit 1
 }
@@ -446,11 +448,11 @@ function Get-VendorCoolingTip([string]$Manufacturer) {
     return 'Check your PC maker''s control app or BIOS/UEFI setup for a "Quiet", "Silent" or "Balanced" fan profile, and make sure it is not set to "Full speed" or "Performance".'
 }
 
-function Invoke-SystemScan([scriptblock]$Progress) {
+function Invoke-SystemScan([scriptblock]$ReportProgress) {
     $script:Findings.Clear()
     $s = @{}
 
-    & $Progress 2 'Reading system information...'
+    & $ReportProgress 2 'Reading system information...'
     $cs   = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
     $os   = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
     $cpus = @(Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue)
@@ -472,25 +474,25 @@ function Invoke-SystemScan([scriptblock]$Progress) {
     $s.Uptime       = (Get-Date) - $os.LastBootUpTime
     $s.Computer     = $env:COMPUTERNAME
 
-    & $Progress 8 'Measuring what is using the processor and graphics (5 seconds)...'
-    $m = Measure-Processes -Seconds 5 -OnTick { param($i, $n) & $Progress (8 + [int](40 * ($i + 1) / $n)) ("Measuring activity... {0}/{1} s" -f ($i + 1), $n) }
+    & $ReportProgress 8 'Measuring what is using the processor and graphics (5 seconds)...'
+    $m = Measure-Processes -Seconds 5 -OnTick { param($i, $n) & $ReportProgress (8 + [int](40 * ($i + 1) / $n)) ("Measuring activity... {0}/{1} s" -f ($i + 1), $n) }
     $s.Measure = $m
 
-    & $Progress 50 'Checking temperatures and fans...'
+    & $ReportProgress 50 'Checking temperatures and fans...'
     $s.Temps = @(Get-Temperatures)
     $s.Fans  = @()
     try { $s.Fans = @(Get-CimInstance Win32_Fan -ErrorAction Stop | Where-Object { $_.DesiredSpeed -or $_.ActiveCooling }) } catch { }
 
-    & $Progress 55 'Checking power settings...'
+    & $ReportProgress 55 'Checking power settings...'
     $s.Power = Get-PowerInfo
 
-    & $Progress 60 'Checking memory...'
+    & $ReportProgress 60 'Checking memory...'
     $s.RamTotalKB = [double]$os.TotalVisibleMemorySize
     $s.RamFreeKB  = [double]$os.FreePhysicalMemory
     $s.RamUsedPct = if ($s.RamTotalKB -gt 0) { [math]::Round(100 * (1 - $s.RamFreeKB / $s.RamTotalKB), 0) } else { 0 }
     $s.CommitPct  = if ($os.TotalVirtualMemorySize -gt 0) { [math]::Round(100 * (1 - $os.FreeVirtualMemory / $os.TotalVirtualMemorySize), 0) } else { 0 }
 
-    & $Progress 64 'Checking drives...'
+    & $ReportProgress 64 'Checking drives...'
     $s.Volumes = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction SilentlyContinue)
     $s.SystemDisk = $null
     $s.PhysicalDisks = @()
@@ -501,24 +503,24 @@ function Invoke-SystemScan([scriptblock]$Progress) {
         $s.SystemDisk = $s.PhysicalDisks | Where-Object { [string]$_.DeviceId -eq [string]$diskNum } | Select-Object -First 1
     } catch { }
 
-    & $Progress 70 'Measuring temporary files...'
+    & $ReportProgress 70 'Measuring temporary files...'
     $cutoff = (Get-Date).AddHours(-24)
     $t1 = Get-FolderStats $env:TEMP $cutoff
     $t2 = Get-FolderStats (Join-Path $env:WINDIR 'Temp') $cutoff
     $s.TempOldBytes = $t1.OldSize + $t2.OldSize
     $s.TempBytes    = $t1.Size + $t2.Size
 
-    & $Progress 76 'Checking startup programs...'
+    & $ReportProgress 76 'Checking startup programs...'
     $s.Startup = @(Get-StartupItems)
 
-    & $Progress 82 'Reading the Windows event log (throttling, crashes, disk errors)...'
+    & $ReportProgress 82 'Reading the Windows event log (throttling, crashes, disk errors)...'
     $since7 = (Get-Date).AddDays(-7); $since30 = (Get-Date).AddDays(-30)
     $s.ThrottleEvents = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-Kernel-Processor-Power'; Id = 37; StartTime = $since7 } -MaxEvents 500 -ErrorAction SilentlyContinue)
     $s.CrashEvents    = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-Kernel-Power'; Id = 41; StartTime = $since30 } -MaxEvents 100 -ErrorAction SilentlyContinue)
     $s.WheaEvents     = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-WHEA-Logger'; StartTime = $since30 } -MaxEvents 100 -ErrorAction SilentlyContinue)
     $s.DiskEvents     = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'disk'; Id = 7, 11, 51, 153; StartTime = $since30 } -MaxEvents 100 -ErrorAction SilentlyContinue)
 
-    & $Progress 88 'Checking battery, security and pending restarts...'
+    & $ReportProgress 88 'Checking battery, security and pending restarts...'
     $s.OnBattery = $false; $s.BatteryWear = $null; $s.BatteryCharge = $null
     if ($bats.Count -gt 0) {
         $s.OnBattery = ($bats[0].BatteryStatus -eq 1)
@@ -535,10 +537,10 @@ function Invoke-SystemScan([scriptblock]$Progress) {
                        (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired')
     $s.ProcessCount = @($m.Rows).Count
 
-    & $Progress 94 'Analysing results...'
+    & $ReportProgress 94 'Analysing results...'
     $script:Scan = $s
     Invoke-Analysis $s
-    & $Progress 100 'Scan complete.'
+    & $ReportProgress 100 'Scan complete.'
 }
 
 # ---------------------------------------------------------------------------
@@ -921,7 +923,7 @@ function Invoke-UndoTuneUps {
 # ---------------------------------------------------------------------------
 #  HTML report
 # ---------------------------------------------------------------------------
-function Export-Report {
+function Export-Report([switch]$NoOpen) {
     if (-not $script:Scan) { [System.Windows.Forms.MessageBox]::Show('Run a scan first.', $script:AppName) | Out-Null; return }
     $s = $script:Scan
     $sb = New-Object System.Text.StringBuilder
@@ -957,7 +959,8 @@ function Export-Report {
     [void]$sb.Append('</table></body></html>')
     $path = Join-Path $script:DataDir ('PC-Report-{0:yyyyMMdd-HHmm}.html' -f (Get-Date))
     Set-Content -LiteralPath $path -Value $sb.ToString() -Encoding UTF8
-    Invoke-Item -LiteralPath $path
+    if (-not $NoOpen) { Invoke-Item -LiteralPath $path }
+    return $path
 }
 
 function Get-SortedFindings {
@@ -1035,8 +1038,8 @@ $pnlTop.Dock = 'Top'; $pnlTop.Height = 64
 $btnScan = New-Button 'Scan my PC' 10 14 160 36
 $btnScan.Font = $fontBold
 $btnScan.BackColor = [System.Drawing.Color]::FromArgb(59, 111, 216); $btnScan.ForeColor = [System.Drawing.Color]::White; $btnScan.FlatStyle = 'Flat'
-$progress = New-Object System.Windows.Forms.ProgressBar
-$progress.Location = New-Object System.Drawing.Point(185, 16); $progress.Size = New-Object System.Drawing.Size(360, 14)
+$script:pbScan = New-Object System.Windows.Forms.ProgressBar
+$script:pbScan.Location = New-Object System.Drawing.Point(185, 16); $script:pbScan.Size = New-Object System.Drawing.Size(360, 14)
 $lblProgress = New-Object System.Windows.Forms.Label
 $lblProgress.Location = New-Object System.Drawing.Point(185, 34); $lblProgress.Size = New-Object System.Drawing.Size(500, 20); $lblProgress.Text = 'Ready.'
 $btnReport = New-Button 'Save HTML report' 700 14 140 36
@@ -1044,7 +1047,7 @@ $btnFolder = New-Button 'Open data folder' 848 14 130 36
 $lblScore = New-Object System.Windows.Forms.Label
 $lblScore.Location = New-Object System.Drawing.Point(990, 10); $lblScore.Size = New-Object System.Drawing.Size(140, 46); $lblScore.Font = $fontBig; $lblScore.Text = ''
 $lblScore.Anchor = 'Top, Right'
-$pnlTop.Controls.AddRange(@($btnScan, $progress, $lblProgress, $btnReport, $btnFolder, $lblScore))
+$pnlTop.Controls.AddRange(@($btnScan, $script:pbScan, $lblProgress, $btnReport, $btnFolder, $lblScore))
 $tabOverview.Controls.Add($pnlTop)
 
 # ---------------- Tab 2: Processes ----------------
@@ -1169,13 +1172,13 @@ function Select-RecommendedTuneUps {
 # ---------------------------------------------------------------------------
 #  Event handlers
 # ---------------------------------------------------------------------------
-$btnScan.Add_Click({
+function Start-Scan {
     $btnScan.Enabled = $false; $btnTuneApply.Enabled = $false
     $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
     $lblScore.Text = ''
     $txtFan.Text = 'Scanning... please keep using the PC as normal (or leave it idle) while the measurements are taken.'
     try {
-        Invoke-SystemScan -Progress { param($pct, $msg) $progress.Value = [math]::Min(100, [math]::Max(0, $pct)); $lblProgress.Text = $msg; [System.Windows.Forms.Application]::DoEvents() }
+        Invoke-SystemScan -ReportProgress { param($pct, $msg) $script:pbScan.Value = [math]::Min(100, [math]::Max(0, [int]$pct)); $script:lblProgress.Text = $msg; [System.Windows.Forms.Application]::DoEvents() }
         $s = $script:Scan
         Show-Findings
         Show-Processes $s.Measure
@@ -1198,7 +1201,8 @@ $btnScan.Add_Click({
         $btnScan.Enabled = $true; $btnTuneApply.Enabled = $true
         $form.Cursor = [System.Windows.Forms.Cursors]::Default
     }
-})
+}
+$btnScan.Add_Click({ Start-Scan })
 
 $lvFind.Add_SelectedIndexChanged({
     if ($lvFind.SelectedItems.Count -eq 0) { return }
@@ -1210,13 +1214,13 @@ $lvFind.Add_SelectedIndexChanged({
     $txtDetail.Text = $t
 })
 
-$btnReport.Add_Click({ Export-Report })
+$btnReport.Add_Click({ [void](Export-Report) })
 $btnFolder.Add_Click({ Invoke-Item -LiteralPath $script:DataDir })
 
 $btnProcRefresh.Add_Click({
     $btnProcRefresh.Enabled = $false; $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
     try {
-        $m = Measure-Processes -Seconds 5 -OnTick { param($i, $n) $btnProcRefresh.Text = "Measuring... $($i + 1)/$n" }
+        $m = Measure-Processes -Seconds 5 -OnTick { param($i, $n) $script:btnProcRefresh.Text = "Measuring... $($i + 1)/$n" }
         Show-Processes $m
     } finally { $btnProcRefresh.Text = 'Re-measure (5 s)'; $btnProcRefresh.Enabled = $true; $form.Cursor = [System.Windows.Forms.Cursors]::Default }
 })
@@ -1323,6 +1327,27 @@ $form.Add_Shown({
     Show-Startup @(Get-StartupItems)
     if (Test-Path -LiteralPath $script:LogPath) { Write-TuneLog "PC TuneUp started. Previous activity is in $($script:LogPath)" } else { Write-TuneLog 'PC TuneUp started.' }
 })
+
+if ($SelfTest) {
+    # Runs the real scan exactly as the Scan button does, without showing the window.
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    Start-Scan
+    Write-Host "Scan took $([int]$sw.Elapsed.TotalSeconds) s"
+    Write-Host '--------- Fan verdict box ---------'
+    Write-Host $txtFan.Text
+    Write-Host '--------- Findings ---------'
+    foreach ($f in (Get-SortedFindings)) { Write-Host ("[{0}] {1}: {2}" -f $f.Severity, $f.Area, $f.Title) }
+    Write-Host ("Processes listed: {0}   Startup items: {1}   Progress bar: {2}%" -f $lvProc.Items.Count, $lvStart.Items.Count, $script:pbScan.Value)
+    $failed = $txtFan.Text -like 'Something went wrong*'
+    try { $rp = Export-Report -NoOpen; Write-Host "Report written: $rp ($((Get-Item $rp).Length) bytes)" } catch { Write-Host "Report failed: $($_.Exception.Message)"; $failed = $true }
+    # Errors that indicate a bug in this script (not expected "not supported on this PC" errors)
+    $bugs = @($Error | Where-Object { $_.FullyQualifiedErrorId -match 'PropertyNotFound|PropertyAssignment|InvokeMethodOnNull|MethodNotFound|MethodCountCouldNotFindBest|ParameterArgument|ParameterBinding|CommandNotFound|NullArray|InvalidCast|ConvertToFinalInvalidCastException|RuntimeException' })
+    Write-Host "PowerShell errors recorded: $($Error.Count) (script bugs: $($bugs.Count))"
+    foreach ($e in $Error) { Write-Host ("  - {0}: {1}  {2}" -f $e.FullyQualifiedErrorId, $e.Exception.Message, ($e.InvocationInfo.PositionMessage -split "`n")[0]) }
+    if ($failed -or $bugs.Count -gt 0) { Write-Host 'SELF-TEST FAILED'; exit 1 }
+    Write-Host 'SELF-TEST PASSED'
+    exit 0
+}
 
 [void]$form.ShowDialog()
 $form.Dispose()

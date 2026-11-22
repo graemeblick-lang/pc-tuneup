@@ -20,6 +20,13 @@ jobs:
         shell: powershell
         run: .\build.ps1
 
+      - name: Self-test - run a real scan on Windows
+        shell: powershell
+        timeout-minutes: 10
+        run: |
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File .\PCTuneUp.ps1 -SelfTest -Limited
+          if ($LASTEXITCODE -ne 0) { throw "Self-test failed (exit code $LASTEXITCODE)" }
+
       - name: Upload exe
         uses: actions/upload-artifact@v4
         with:

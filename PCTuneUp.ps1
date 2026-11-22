@@ -12,7 +12,7 @@
 param(
     [switch]$Limited,    # do not ask for administrator rights
     [switch]$SelfTest,   # run a full scan without showing the window, print the results, exit (used by the build)
-    [switch]$SimulateNoWmi  # testing only: pretend Windows Management Instrumentation (WMI) is not answering
+    [switch]$SimulateNoWmi, # testing only: pretend Windows Management Instrumentation (WMI) is not answering
     [string]$DataRoot    # folder to keep reports/undo data in (the .exe passes its own folder)
 )
 
